@@ -1,5 +1,81 @@
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlencode
+
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
+
+
+SHARE_DATA_FILE = Path("shared_consultations.json")
+
+
+def load_shared_consultations():
+    if not SHARE_DATA_FILE.exists():
+        return {}
+    try:
+        return json.loads(SHARE_DATA_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_shared_consultations(data):
+    SHARE_DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_share_url(share_id):
+    """배포 URL은 .streamlit/secrets.toml의 APP_BASE_URL로 설정합니다."""
+    base_url = st.secrets.get("APP_BASE_URL", "http://localhost:8501").rstrip("/")
+    return f"{base_url}?{urlencode({'share': share_id})}"
+
+
+def get_last_consultation():
+    """대화 전체가 아닌 마지막 질문·답변만 공유합니다."""
+    messages = st.session_state.messages
+    last_user_index = next(
+        (i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "user"),
+        None,
+    )
+    if last_user_index is None:
+        return None
+    answer = next(
+        (m["content"] for m in messages[last_user_index + 1 :] if m["role"] == "assistant"),
+        "",
+    )
+    return {"question": messages[last_user_index]["content"], "answer": answer}
+
+
+def render_kakao_share_button(share_url, title):
+    """KAKAO_JAVASCRIPT_KEY가 설정된 경우 카카오톡 공유 버튼을 렌더링합니다."""
+    kakao_key = st.secrets.get("KAKAO_JAVASCRIPT_KEY", "")
+    if not kakao_key:
+        st.sidebar.info("카카오톡 공유는 KAKAO_JAVASCRIPT_KEY 설정 후 사용할 수 있습니다.")
+        return
+
+    components.html(
+        f"""
+        <script src="https://t1.kakaocdn.net/kakao_js_sdk/2.7.2/kakao.min.js"></script>
+        <button id="kakao-share" style="background:#FEE500;border:0;border-radius:8px;padding:10px 16px;font-weight:bold;cursor:pointer;">
+          💬 카카오톡으로 공유
+        </button>
+        <script>
+          if (!Kakao.isInitialized()) Kakao.init({json.dumps(kakao_key)});
+          document.getElementById('kakao-share').onclick = () => Kakao.Share.sendDefault({{
+            objectType: 'feed',
+            content: {{
+              title: {json.dumps(title, ensure_ascii=False)},
+              description: 'AI 가족마음 상담 내용을 확인해 보세요.',
+              imageUrl: 'https://images.unsplash.com/photo-1499209974431-9dddcece7f88?auto=format&fit=crop&w=800&q=80',
+              link: {{ mobileWebUrl: {json.dumps(share_url)}, webUrl: {json.dumps(share_url)} }}
+            }},
+            buttons: [{{ title: '상담 내용 보기', link: {{ mobileWebUrl: {json.dumps(share_url)}, webUrl: {json.dumps(share_url)} }} }}]
+          }});
+        </script>
+        """,
+        height=55,
+    )
 
 
 # --------------------------------------------------
@@ -16,6 +92,22 @@ st.write(
     "가족 간 갈등, 대화의 어려움, 양육 고민을 함께 정리해 보세요. "
     "이 서비스는 전문 치료를 대신하지 않는 정서적 지원·정보 제공 도구입니다."
 )
+
+# 공유 링크로 열렸을 때는 API Key 없이 공개된 익명 상담을 먼저 보여줍니다.
+share_id = st.query_params.get("share")
+if share_id:
+    shared_item = load_shared_consultations().get(share_id)
+    if shared_item:
+        st.info("작성자가 익명 공개에 동의한 상담 내용입니다.", icon="🔗")
+        st.subheader(shared_item["title"])
+        st.caption(f"공유일: {shared_item['created_at']}")
+        st.markdown("### 🙋 고민")
+        st.markdown(shared_item["question"])
+        st.markdown("### 💛 상담 답변")
+        st.markdown(shared_item["answer"])
+        st.divider()
+    else:
+        st.warning("공유 상담을 찾을 수 없거나 삭제되었습니다.")
 
 
 # --------------------------------------------------
@@ -144,11 +236,35 @@ for message in st.session_state.messages:
 
 
 # --------------------------------------------------
-# 사용자 질문 및 AI 응답
+# 음성 입력
 # --------------------------------------------------
-prompt = st.chat_input("가족 관계에서 고민되는 상황을 입력해주세요...")
+st.divider()
+st.caption("🎙️ 음성으로 상담하기")
+audio_value = st.audio_input("마이크 버튼을 눌러 고민을 말씀해 주세요.")
+voice_prompt = None
+
+if audio_value and st.button("음성을 글로 바꾸고 상담하기"):
+    with st.spinner("음성을 텍스트로 변환하고 있습니다..."):
+        try:
+            transcription = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=("family_counseling_audio.wav", audio_value.getvalue(), audio_value.type),
+                language="ko",
+            )
+            voice_prompt = transcription.text.strip()
+        except Exception as error:
+            st.error(f"음성을 처리하지 못했습니다. 마이크 권한과 API 설정을 확인해주세요. ({error})")
+
+
+# --------------------------------------------------
+# 텍스트 질문 및 AI 응답
+# --------------------------------------------------
+typed_prompt = st.chat_input("가족 관계에서 고민되는 상황을 입력해주세요...")
+prompt = voice_prompt or typed_prompt
 
 if prompt:
+    if voice_prompt:
+        st.success(f"음성 해석 결과: {voice_prompt}")
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
@@ -173,3 +289,36 @@ if prompt:
         response = st.write_stream(response_generator())
 
     st.session_state.messages.append({"role": "assistant", "content": response})
+
+
+# --------------------------------------------------
+# 지식인 형태의 익명 공유 및 카카오톡 공유
+# --------------------------------------------------
+st.sidebar.divider()
+st.sidebar.subheader("🔗 상담 사연 공유")
+st.sidebar.caption(
+    "마지막 질문과 답변만 공개됩니다. 이름·연락처·학교·직장·구체적 장소 등 개인정보를 지운 뒤 공유해주세요."
+)
+share_consent = st.sidebar.checkbox("개인정보를 제거했고, 익명 공개에 동의합니다.")
+share_title = st.sidebar.text_input("공유 글 제목", value="가족마음 상담 이야기", max_chars=60)
+
+if st.sidebar.button("익명 공유 링크 만들기", disabled=not share_consent):
+    consultation = get_last_consultation()
+    if not consultation or not consultation["answer"]:
+        st.sidebar.warning("AI 답변이 포함된 상담 후에 공유할 수 있습니다.")
+    else:
+        new_share_id = uuid.uuid4().hex
+        shared_consultations = load_shared_consultations()
+        shared_consultations[new_share_id] = {
+            "title": share_title,
+            "question": consultation["question"],
+            "answer": consultation["answer"],
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        }
+        save_shared_consultations(shared_consultations)
+        st.session_state.last_share_url = make_share_url(new_share_id)
+        st.sidebar.success("익명 공유 링크를 만들었습니다.")
+
+if st.session_state.get("last_share_url"):
+    st.sidebar.link_button("🔗 공유 상담 열기", st.session_state.last_share_url)
+    render_kakao_share_button(st.session_state.last_share_url, share_title)
